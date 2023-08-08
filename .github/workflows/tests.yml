@@ -39,4 +39,9 @@ jobs:
           composer update --no-progress --prefer-dist --no-interaction
 
       - name: Execute the tests
-        run: vendor/bin/phpunit -vvv
+        run: vendor/bin/phpunit --testdox
+
+      - name: 'Qodana Scan'
+        uses: JetBrains/qodana-action@main
+        env:
+            QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}

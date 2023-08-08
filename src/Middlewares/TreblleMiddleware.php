@@ -8,33 +8,37 @@ use Closure;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
-use Illuminate\Support\Arr;
-use Illuminate\Support\Facades\Cache;
-use Psr\SimpleCache\InvalidArgumentException;
-use Treblle\Core\Http\Endpoint;
+use Symfony\Component\HttpFoundation\Response as SymfonyResponse;
 use Treblle\Exceptions\ConfigurationException;
 use Treblle\Exceptions\TreblleApiException;
 use Treblle\Factories\DataFactory;
+use Treblle\Http\Endpoint;
 use Treblle\Treblle;
 
 class TreblleMiddleware
 {
+    public static float $start = 0.00;
+
+    public static null|string $project = null;
+
     /**
      * @param DataFactory $factory
      */
     public function __construct(
         protected readonly DataFactory $factory,
-    ) {}
+    ) {
+    }
 
     /**
      * @param Request $request
      * @param Closure $next
      * @param string|null $projectId
-     * @return Response|JsonResponse
+     * @return Response|JsonResponse|SymfonyResponse
      */
-    public function handle(Request $request, Closure $next, string $projectId = null): Response|JsonResponse
+    public function handle(Request $request, Closure $next, string $projectId = null): Response|JsonResponse|SymfonyResponse
     {
-        $request->attributes->add(['projectId' => $projectId]);
+        self::$start = \microtime(true);
+        self::$project = $projectId;
 
         return $next($request);
     }
@@ -43,53 +47,56 @@ class TreblleMiddleware
      * @param Request $request
      * @param JsonResponse|Response $response
      * @return void
-     * @throws ConfigurationException|TreblleApiException|InvalidArgumentException
+     * @throws ConfigurationException|TreblleApiException
      */
     public function terminate(Request $request, JsonResponse|Response $response): void
     {
-        Treblle::log(
-            endpoint: Arr::random(Endpoint::cases()),
-            data: $this->factory->make(
-                request: $request,
-                response: $response,
-                loadTime: $this->getLoadTime(request: $request),
-            ),
-            projectId: $request->attributes->get('project_id') ?? \config('treblle.project_id')
-        );
+        if (!function_exists('pcntl_fork')) {
+            $this->collectData($request, $response);
+            return;
+        }
+
+        $pid = pcntl_fork();
+
+        if ($this->isUnableToForkProcess($pid)) {
+            $this->collectData($request, $response);
+            return;
+        }
+
+        if ($this->isChildProcess($pid)) {
+            $this->collectData($request, $response);
+            $this->killProcessWithId((int)getmypid());
+        }
     }
 
     /**
-     * @param Request $request
-     * @return float
-     * @throws InvalidArgumentException
+     * @throws ConfigurationException |TreblleApiException
      */
-    private function getLoadTime(Request $request): float
+    protected function collectData(Request $request, JsonResponse|Response $response): void
     {
-        if (isset($_SERVER['OCTANE_DATABASE_SESSION_TTL'])) {
-            if (config('octane.server') === 'swoole') {
-                return (float) microtime(true) - floatval(Cache::store('octane')->get(app('treblle-identifier')));
-            }
-
-            if (isset($_SERVER['REQUEST_TIME_FLOAT'])) {
-                return (float) microtime(true) - $_SERVER['REQUEST_TIME_FLOAT'];
-            }
-
-            if (config('octane.server') === 'swoole') {
-                return (float) microtime(true) - floatval(Cache::get(app('treblle-identifier')));
-            }
-
-            return 0.0000;
-        }
-
-        if (isset($_SERVER['REQUEST_TIME_FLOAT'])) {
-            return (float) microtime(true) - $_SERVER['REQUEST_TIME_FLOAT'];
-        }
-
-        return 0.0000;
+        Treblle::log(
+            endpoint: Endpoint::PUNISHER,
+            data: $this->factory->make(
+                request: $request,
+                response: $response,
+                loadTime: \microtime(true) - self::$start,
+            ),
+            projectId: self::$project ?? (string) \config('treblle.project_id'),
+        );
     }
 
-    private function httpServerIsOctane(): bool
+    private function isChildProcess(int $pid): bool
     {
-        return isset($_ENV['OCTANE_DATABASE_SESSION_TTL']);
+        return $pid === 0;
+    }
+
+    private function isUnableToForkProcess(int $pid): bool
+    {
+        return $pid === -1;
+    }
+
+    private function killProcessWithId(int $pid): void
+    {
+        strtoupper(substr(PHP_OS, 0, 3)) === 'WIN' ? exec("taskkill /F /T /PID $pid") : exec("kill -9 $pid");
     }
 }
